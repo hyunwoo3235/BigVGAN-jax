@@ -1,8 +1,9 @@
-from typing import Tuple, Sequence, Union, Optional
+from typing import Tuple, Sequence, Union, Optional, List
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from audax.core.functional import spectrogram
 
 import activations
 from alias_free_jax import Activation1d
@@ -174,6 +175,7 @@ class AMPBlock1(nn.Module):
 
 
 class BigVGAN(nn.Module):
+    num_mels: int
     resblock_kernel_sizes: list
     resblock_dilation_sizes: list
     upsample_rates: tuple
@@ -187,7 +189,9 @@ class BigVGAN(nn.Module):
         self.num_kernels = len(self.resblock_kernel_sizes)
         self.num_upsamples = len(self.upsample_rates)
 
-        self.conv_pre = nn.Conv(self.upsample_initial_channel, (7,), 1, padding=3)
+        self.conv_pre = FlaxConvWithWeightNorm(
+            self.num_mels, self.upsample_initial_channel, (7,), (1,), dtype=self.dtype
+        )
 
         ups = []
         for i, (u, k) in enumerate(
@@ -250,3 +254,225 @@ class BigVGAN(nn.Module):
         x = nn.tanh(x)
 
         return x
+
+
+class DiscriminatorP(nn.Module):
+    period: int
+    d_mult: int
+    kernel_size: int = 5
+    stride: int = 3
+    use_spectral_norm: bool = False
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        if self.use_spectral_norm:
+            raise NotImplementedError
+
+        self.convs = [
+            FlaxConvWithWeightNorm(
+                1, 32 * self.d_mult, (self.kernel_size, 1), (self.stride, 1)
+            ),
+            FlaxConvWithWeightNorm(
+                32 * self.d_mult,
+                128 * self.d_mult,
+                (self.kernel_size, 1),
+                (self.stride, 1),
+            ),
+            FlaxConvWithWeightNorm(
+                128 * self.d_mult,
+                512 * self.d_mult,
+                (self.kernel_size, 1),
+                (self.stride, 1),
+            ),
+            FlaxConvWithWeightNorm(
+                512 * self.d_mult,
+                1024 * self.d_mult,
+                (self.kernel_size, 1),
+                (self.stride, 1),
+            ),
+            FlaxConvWithWeightNorm(
+                1024 * self.d_mult, 1024 * self.d_mult, (self.kernel_size, 1), 1
+            ),
+        ]
+        self.conv_post = FlaxConvWithWeightNorm(1024 * self.d_mult, 1, (3, 1), 1)
+
+    def __call__(self, x):
+        fmap = []
+
+        b, t, c = x.shape
+        if t % self.period != 0:
+            n_pad = self.period - (t % self.period)
+            x = jnp.pad(x, ((0, 0), (0, n_pad), (0, 0)), mode="reflect")
+            t = t + n_pad
+        x = x.reshape(b, t // self.period, self.period, c)
+
+        for l in self.convs:
+            x = l(x)
+            x = nn.leaky_relu(x, LRELU_SLOPE)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = x.reshape(1, -1)
+        return x, fmap
+
+
+class MultiPeriodDiscriminator(nn.Module):
+    mpd_reshapes: list = [2, 3, 5, 7, 11]
+    use_spectral_norm: bool = False
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        if self.use_spectral_norm:
+            raise NotImplementedError
+        self.discriminators = [
+            DiscriminatorP(period, use_spectral_norm=self.use_spectral_norm)
+            for period in self.mpd_reshapes
+        ]
+
+    def __call__(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+
+        for i, d in enumerate(self.discriminators):
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
+class DiscriminatorR(nn.Module):
+    resolution: List[int]
+    d_mult: int = 1
+    use_spectral_norm: bool = False
+
+    def setup(self):
+        if self.use_spectral_norm:
+            raise NotImplementedError
+
+        self.convs = [
+            FlaxConvWithWeightNorm(1, 32 * self.d_mult, (3, 9)),
+            FlaxConvWithWeightNorm(32 * self.d_mult, 32 * self.d_mult, (3, 9), (1, 2)),
+            FlaxConvWithWeightNorm(32 * self.d_mult, 32 * self.d_mult, (3, 9), (1, 2)),
+            FlaxConvWithWeightNorm(32 * self.d_mult, 32 * self.d_mult, (3, 9), (1, 2)),
+            FlaxConvWithWeightNorm(32 * self.d_mult, 32 * self.d_mult, (3, 9)),
+        ]
+        self.conv_post = FlaxConvWithWeightNorm(32 * self.d_mult, 1, (3, 3))
+
+        self.hann_window = self.variable(
+            "params", "filter", lambda: jnp.hanning(self.resolution[2])
+        )
+
+    def __call__(self, x):
+        fmap = []
+
+        x = self.spectrogram(x)
+
+        for l in self.convs:
+            x = l(x)
+            x = nn.leaky_relu(x, LRELU_SLOPE)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = x.reshape(1, -1)
+        return x, fmap
+
+    def spectrogram(self, x):
+        n_fft, hop_length, win_length = self.resolution
+        x = jnp.pad(
+            x,
+            (
+                (0, 0),
+                (int((n_fft - hop_length) / 2), int((n_fft - hop_length) / 2)),
+                (0, 0),
+            ),
+            mode="reflect",
+        )
+        spec = spectrogram(
+            x,
+            pad=0,
+            window=self.hann_window.value,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            power=1.0,
+            normalized=False,
+            center=False,
+            onesided=True,
+        )
+        return spec
+
+
+class MultiResolutionDiscriminator(nn.Module):
+    resolutions: list
+    d_mult: int = 1
+    use_spectral_norm: bool = False
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        assert (
+            len(self.resolutions) == 3
+        ), f"MRD requires list of list with len=3, each element having a list with len=3. got {self.resolutions}"
+        if self.use_spectral_norm:
+            raise NotImplementedError
+        self.discriminators = [
+            DiscriminatorR(
+                resolution, d_mult=self.d_mult, use_spectral_norm=self.use_spectral_norm
+            )
+            for resolution in self.resolutions
+        ]
+
+    def __call__(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+
+        for i, d in enumerate(self.discriminators):
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
+def feature_loss(fmap_r, fmap_g):
+    loss = 0
+    for dr, dg in zip(fmap_r, fmap_g):
+        for rl, gl in zip(dr, dg):
+            loss += jnp.mean(jnp.abs(rl - gl))
+
+    return loss * 2
+
+
+def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    loss = 0
+    r_losses = []
+    g_losses = []
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        r_loss = jnp.mean((1 - dr) ** 2)
+        g_loss = jnp.mean(dg**2)
+        loss += r_loss + g_loss
+        r_losses.append(r_loss.item())
+        g_losses.append(g_loss.item())
+
+    return loss, r_losses, g_losses
+
+
+def generator_loss(disc_outputs):
+    loss = 0
+    gen_losses = []
+    for dg in disc_outputs:
+        l = jnp.mean((1 - dg) ** 2)
+        gen_losses.append(l)
+        loss += l
+
+    return loss, gen_losses
