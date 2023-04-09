@@ -1,4 +1,4 @@
-from typing import Tuple, Sequence, Union, Optional, List
+from typing import Tuple, Sequence, Union, Optional, List, Dict
 
 import flax.linen as nn
 import jax
@@ -258,7 +258,7 @@ class BigVGAN(nn.Module):
 
 class DiscriminatorP(nn.Module):
     period: int
-    d_mult: int
+    d_mult: int = 1
     kernel_size: int = 5
     stride: int = 3
     use_spectral_norm: bool = False
@@ -317,7 +317,8 @@ class DiscriminatorP(nn.Module):
 
 
 class MultiPeriodDiscriminator(nn.Module):
-    mpd_reshapes: list = [2, 3, 5, 7, 11]
+    mpd_reshapes: list = (2, 3, 5, 7, 11)
+    d_mult: int = 1
     use_spectral_norm: bool = False
     dtype: jnp.dtype = jnp.float32
 
@@ -325,7 +326,9 @@ class MultiPeriodDiscriminator(nn.Module):
         if self.use_spectral_norm:
             raise NotImplementedError
         self.discriminators = [
-            DiscriminatorP(period, use_spectral_norm=self.use_spectral_norm)
+            DiscriminatorP(
+                period, self.d_mult, use_spectral_norm=self.use_spectral_norm
+            )
             for period in self.mpd_reshapes
         ]
 
@@ -372,6 +375,7 @@ class DiscriminatorR(nn.Module):
         fmap = []
 
         x = self.spectrogram(x)
+        x = jnp.expand_dims(x, -1)
 
         for l in self.convs:
             x = l(x)
@@ -405,11 +409,12 @@ class DiscriminatorR(nn.Module):
             center=False,
             onesided=True,
         )
+        spec = spec.transpose((0, 2, 1))
         return spec
 
 
 class MultiResolutionDiscriminator(nn.Module):
-    resolutions: list
+    resolutions: Tuple[Tuple[int]]
     d_mult: int = 1
     use_spectral_norm: bool = False
     dtype: jnp.dtype = jnp.float32
@@ -442,6 +447,47 @@ class MultiResolutionDiscriminator(nn.Module):
             fmap_gs.append(fmap_g)
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+
+class MultiDiscriminator(nn.Module):
+    mpd_reshapes: Tuple[int] = (2, 3, 5, 7, 11)
+    resolutions: Tuple[Tuple[int]] = (
+        ((1024, 120, 600), (2048, 240, 1200), (512, 50, 240)),
+    )
+    d_mult: int = 1
+    use_spectral_norm: bool = False
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        if self.use_spectral_norm:
+            raise NotImplementedError
+        self.mpd = MultiPeriodDiscriminator(
+            self.mpd_reshapes,
+            d_mult=self.d_mult,
+            use_spectral_norm=self.use_spectral_norm,
+            dtype=self.dtype,
+        )
+        self.mrd = MultiResolutionDiscriminator(
+            self.resolutions[0],
+            d_mult=self.d_mult,
+            use_spectral_norm=self.use_spectral_norm,
+            dtype=self.dtype,
+        )
+
+    def __call__(self, y, y_hat):
+        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat)
+        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.mrd(y, y_hat)
+
+        return (
+            y_df_hat_r,
+            y_df_hat_g,
+            fmap_f_r,
+            fmap_f_g,
+            y_ds_hat_r,
+            y_ds_hat_g,
+            fmap_s_r,
+            fmap_s_g,
+        )
 
 
 def feature_loss(fmap_r, fmap_g):
