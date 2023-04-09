@@ -507,8 +507,8 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = jnp.mean((1 - dr) ** 2)
         g_loss = jnp.mean(dg**2)
         loss += r_loss + g_loss
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        r_losses.append(jnp.array(r_loss, float))
+        g_losses.append(jnp.array(g_loss, float))
 
     return loss, r_losses, g_losses
 
